@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 
 from portrait_core.invariants.invariant_stats import build_invariant_stats
 
@@ -27,7 +27,7 @@ class InvariantStatsTestCase(unittest.TestCase):
         stat = result["stats"]["ipd_face_width"]
         self.assertEqual(stat["count"], 3)
         self.assertLess(stat["cv"], 0.05)
-        self.assertEqual(stat["stability_score"], stat["cv"])
+        self.assertEqual(stat["stability_score"], round(1.0 - stat["cv"], 6))
         self.assertEqual(stat["stability_class"], "excellent")
 
     def test_stability_classes(self):

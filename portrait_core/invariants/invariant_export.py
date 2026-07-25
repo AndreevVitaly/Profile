@@ -26,10 +26,13 @@ def invariant_set_from_dict(payload: dict[str, Any]) -> InvariantSet:
             name=name,
             numerator=ratio["numerator"],
             denominator=ratio["denominator"],
-            value=float(ratio["value"]),
+            value=None if ratio.get("value") is None else float(ratio["value"]),
             category=ratio["category"],
+            valid=bool(ratio.get("valid", True)),
             source=ratio.get("source", "measurements"),
             quality=ratio.get("quality", "ok"),
+            skipped_reason=ratio.get("skipped_reason"),
+            diagnostics=dict(ratio.get("diagnostics") or {}),
         )
         for name, ratio in (payload.get("ratios") or {}).items()
     }
@@ -37,7 +40,10 @@ def invariant_set_from_dict(payload: dict[str, Any]) -> InvariantSet:
         portrait_id=payload.get("portrait_id"),
         dataset_id=payload.get("dataset_id"),
         pfr_id=payload.get("pfr_id"),
+        pfr_uuid=payload.get("pfr_uuid"),
         ratios=ratios,
+        quality=dict(payload.get("quality") or {}),
+        diagnostics=dict(payload.get("diagnostics") or {}),
         warnings=list(payload.get("warnings") or []),
         source=dict(payload.get("source") or {}),
         metadata=dict(payload.get("metadata") or {}),
@@ -58,10 +64,11 @@ def build_invariants_for_portrait(
     pfr_path = Path(portrait_json_path)
     pfr = read_json(pfr_path)
     target = Path(output_path) if output_path is not None else default_invariants_path(pfr_path)
-    source_base = target.parent if target.parent.exists() else pfr_path.parent
+    source_base = pfr_path.parent.parent if pfr_path.parent.name == "pfr" else target.parent if target.parent.exists() else pfr_path.parent
+    relative_pfr = as_posix(pfr_path, source_base)
     invariant_set = build_invariant_set_from_pfr(
         pfr,
-        source={"portrait_json": as_posix(pfr_path, source_base)},
+        source={"portrait_json": relative_pfr, "source_pfr": relative_pfr},
     )
     save_invariant_set(invariant_set, target)
     return invariant_set.to_dict()

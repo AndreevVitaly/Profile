@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dataset", required=True, help="Path to DS-* archive")
     run.add_argument("--force-pfr", action="store_true")
     run.add_argument("--force-invariants", action="store_true")
+    run.add_argument("--stages", help="Comma-separated stages, e.g. invariants,invariant_stats")
     run.add_argument("--skip-pfr", action="store_true")
     run.add_argument("--skip-invariants", action="store_true")
     run.add_argument("--skip-lic", action="store_true")
@@ -33,6 +34,7 @@ def main() -> None:
         config = {
             "force_pfr": args.force_pfr,
             "force_invariants": args.force_invariants,
+            "stages": args.stages,
             "skip_pfr": args.skip_pfr,
             "skip_invariants": args.skip_invariants,
             "skip_lic": args.skip_lic,

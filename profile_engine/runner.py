@@ -18,7 +18,10 @@ def run_profile_engine(
     status = "completed"
 
     try:
+        selected = _selected_stage_names(context.config.get("stages"))
         for stage in default_stages():
+            if selected is not None and stage.name not in selected:
+                continue
             try:
                 result = stage.run(context)
             except StageFatalError as error:
@@ -62,3 +65,24 @@ def run_profile_engine(
         "artifacts": context.artifacts,
         "stages": context.stages,
     }
+
+
+def _selected_stage_names(value: Any) -> set[str] | None:
+    if not value:
+        return None
+    aliases = {
+        "invariants": "build_invariants",
+        "invariant_stats": "build_invariant_stats",
+        "stats": "build_invariant_stats",
+        "readiness": "build_invariant_readiness",
+        "pfr": "ensure_pfr",
+        "validate": "validate_dataset",
+        "lic": "lic",
+        "report": "report_pack",
+        "report_pack": "report_pack",
+    }
+    if isinstance(value, str):
+        raw_names = [item.strip() for item in value.split(",")]
+    else:
+        raw_names = [str(item).strip() for item in value]
+    return {aliases.get(name, name) for name in raw_names if name}

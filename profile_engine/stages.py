@@ -224,32 +224,74 @@ class BuildInvariantsStage(BaseStage):
             return self.result("skipped", actions=["skip_invariants enabled"])
 
         context.paths["invariants_dir"].mkdir(parents=True, exist_ok=True)
+        dataset = context.read_dataset()
+        items = list(dataset.get("items") or [])
         created = 0
-        skipped = 0
+        skipped_existing = 0
+        failed = 0
+        processed = 0
         warnings: list[str] = []
         force = bool(context.config.get("force_invariants"))
 
-        for pfr_path in _pfr_paths(context):
+        for item in items:
+            pfr_value = item.get("pfr_path")
+            if not pfr_value:
+                if item.get("status") == "rejected":
+                    continue
+                warnings.append(f"item without pfr_path skipped: {item.get('image_path')}")
+                continue
+            pfr_path = _resolve_dataset_path(context, pfr_value)
+            if not pfr_path.exists():
+                warnings.append(f"pfr_path missing: {context.relative_path(pfr_path)}")
+                failed += 1
+                continue
+            processed += 1
             output_path = context.paths["invariants_dir"] / f"{pfr_path.stem}_invariants.json"
-            if output_path.exists() and not force:
-                skipped += 1
-                continue
-            if context.config.get("dry_run"):
-                skipped += 1
-                continue
-            build_invariants_for_portrait(pfr_path, output_path)
-            context.add_artifact("invariants", output_path)
-            created += 1
+            relative_output = as_posix(output_path, context.dataset_path)
 
-        if created == 0 and skipped == 0:
-            warnings.append("no PFR files found for invariant build")
+            if output_path.exists() and not force:
+                try:
+                    payload = read_json(output_path)
+                    if payload.get("schema") != "profile.invariants.v1":
+                        warnings.append(f"incompatible invariants schema skipped: {relative_output}")
+                        failed += 1
+                        continue
+                    item["invariants_path"] = relative_output
+                    skipped_existing += 1
+                    continue
+                except Exception as error:  # noqa: BLE001
+                    warnings.append(f"corrupted invariants file: {relative_output}: {error}")
+                    failed += 1
+                    continue
+
+            if context.config.get("dry_run"):
+                skipped_existing += 1
+                continue
+            try:
+                build_invariants_for_portrait(pfr_path, output_path)
+                item["invariants_path"] = relative_output
+                context.add_artifact("invariants", output_path)
+                created += 1
+            except Exception as error:  # noqa: BLE001
+                warnings.append(f"invariants failed for {context.relative_path(pfr_path)}: {error}")
+                failed += 1
+
+        if processed == 0:
+            warnings.append("no valid PFR files found for invariant build")
+        if not context.config.get("dry_run"):
+            write_dataset_files(context.dataset_path, dataset)
         for warning in warnings:
             context.add_warning(warning)
         return self.result(
-            "completed",
-            actions=["invariants checked"],
+            "completed" if failed == 0 else "warning",
+            actions=["invariants checked", "dataset.json invariants_path updated"],
             warnings=warnings,
-            stats={"created": created, "skipped_existing": skipped},
+            stats={
+                "processed": processed,
+                "created": created,
+                "skipped_existing": skipped_existing,
+                "failed": failed,
+            },
         )
 
 
@@ -260,22 +302,130 @@ class BuildInvariantStatsStage(BaseStage):
         if context.config.get("skip_invariants"):
             return self.result("skipped", actions=["skip_invariants enabled"])
 
-        paths = _invariant_paths(context)
-        if not paths:
+        entries = _invariant_entries(context)
+        if not entries:
             warning = "no invariants files found for stats"
             context.add_warning(warning)
             return self.result("skipped", warnings=[warning])
-        output_path = context.paths["invariants_dir"] / "stats.json"
+
+        samples = {
+            "all_valid_pfr": [entry for entry in entries if entry["status"] in {"passed", "warning"}],
+            "passed_only": [entry for entry in entries if entry["status"] == "passed"],
+            "passed_and_warning": [entry for entry in entries if entry["status"] in {"passed", "warning"}],
+        }
+        stats_by_sample: dict[str, Any] = {}
+        warnings: list[str] = []
+        for name, sample_entries in samples.items():
+            if not sample_entries:
+                warnings.append(f"stats sample empty: {name}")
+                continue
+            stats_by_sample[name] = build_invariant_stats(
+                [entry["path"] for entry in sample_entries],
+                sample_name=name,
+            )
+
+        output_path = context.dataset_path / "invariant_stats.json"
+        legacy_path = context.paths["invariants_dir"] / "stats.json"
+        payload = {
+            "schema": "profile.invariants.dataset_stats.v1",
+            "dataset_id": context.dataset_id,
+            "samples": stats_by_sample,
+            "quality_samples": {name: len(value) for name, value in samples.items()},
+            "warnings": warnings,
+        }
         if not context.config.get("dry_run"):
-            build_invariant_stats(paths, output_path=output_path)
+            write_json(output_path, payload)
+            write_json(legacy_path, stats_by_sample.get("all_valid_pfr") or payload)
             context.add_artifact("invariant_stats", output_path)
+            context.add_artifact("invariant_stats_legacy", legacy_path)
+        for warning in warnings:
+            context.add_warning(warning)
+        ratios_analyzed = len((stats_by_sample.get("all_valid_pfr") or {}).get("stats", {}))
         return self.result(
-            "completed",
+            "completed" if stats_by_sample else "warning",
             actions=["invariant stats built"],
-            stats={"input_files": len(paths)},
+            warnings=warnings,
+            stats={
+                "input_files": len(entries),
+                "ratios_total": ratios_analyzed,
+                "ratios_analyzed": ratios_analyzed,
+                "samples": {name: len(value) for name, value in samples.items()},
+            },
             artifacts=[context.relative_path(output_path)],
         )
 
+
+class InvariantReadinessStage(BaseStage):
+    name = "build_invariant_readiness"
+
+    def run(self, context: ProfileEngineContext) -> dict[str, Any]:
+        entries = _invariant_entries(context)
+        dataset = context.read_dataset()
+        items = list(dataset.get("items") or [])
+        stats_path = context.dataset_path / "invariant_stats.json"
+        stats_payload = read_json(stats_path) if stats_path.exists() else {}
+        all_stats = ((stats_payload.get("samples") or {}).get("all_valid_pfr") or {}).get("stats") or {}
+        ratios_available = sorted(
+            name for name, stat in all_stats.items() if stat.get("count_valid", stat.get("count", 0)) > 0
+        )
+        ratios_with_sufficient_samples = sorted(
+            name for name, stat in all_stats.items() if stat.get("count_valid", stat.get("count", 0)) >= 3
+        )
+        quality_distribution: dict[str, int] = {}
+        for item in items:
+            status = str(item.get("status") or "unknown")
+            quality_distribution[status] = quality_distribution.get(status, 0) + 1
+
+        reasons: list[str] = []
+        limitations: list[str] = [
+            "single dataset can show within-series stability only",
+            "no claim of universal validated facial invariants is made",
+        ]
+        if not entries:
+            reasons.append("no invariants files available")
+        if len(entries) < 3:
+            reasons.append("fewer than 3 invariant observations")
+        if not ratios_with_sufficient_samples:
+            reasons.append("no ratio has sufficient samples for stability statistics")
+
+        if not entries or not ratios_with_sufficient_samples:
+            status = "not_ready"
+        elif reasons or quality_distribution.get("warning", 0):
+            status = "partially_ready"
+        else:
+            status = "ready"
+
+        payload = {
+            "schema": "profile.invariant_readiness.v1",
+            "dataset_id": context.dataset_id,
+            "pfr_total": sum(1 for item in items if item.get("pfr_path")),
+            "pfr_processed": len(entries),
+            "pfr_failed": sum(1 for item in items if item.get("pfr_path") and not item.get("invariants_path")),
+            "invariants_created": len(entries),
+            "ratios_available": ratios_available,
+            "ratios_with_sufficient_samples": ratios_with_sufficient_samples,
+            "quality_distribution": quality_distribution,
+            "research_readiness": {
+                "status": status,
+                "reasons": reasons,
+                "limitations": limitations,
+            },
+        }
+        output_path = context.dataset_path / "invariant_readiness.json"
+        if not context.config.get("dry_run"):
+            write_json(output_path, payload)
+            context.add_artifact("invariant_readiness", output_path)
+        return self.result(
+            "completed",
+            actions=["invariant readiness report built"],
+            stats={
+                "status": status,
+                "pfr_processed": len(entries),
+                "ratios_available": len(ratios_available),
+                "ratios_with_sufficient_samples": len(ratios_with_sufficient_samples),
+            },
+            artifacts=[context.relative_path(output_path)],
+        )
 
 class LICStage(BaseStage):
     name = "lic"
@@ -336,6 +486,7 @@ def default_stages() -> list[BaseStage]:
         EnsurePFRStage(),
         BuildInvariantsStage(),
         BuildInvariantStatsStage(),
+        InvariantReadinessStage(),
         LICStage(),
         ReportPackStage(),
     ]
@@ -368,3 +519,29 @@ def _invariant_paths(context: ProfileEngineContext) -> list[Path]:
         for path in context.paths["invariants_dir"].glob("*.json")
         if path.name != "stats.json"
     )
+
+
+def _resolve_dataset_path(context: ProfileEngineContext, value: str | Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else context.dataset_path / path
+
+
+def _invariant_entries(context: ProfileEngineContext) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    try:
+        dataset = context.read_dataset()
+    except Exception:  # noqa: BLE001
+        dataset = {}
+    for item in dataset.get("items") or []:
+        invariant_path = item.get("invariants_path")
+        if not invariant_path:
+            continue
+        path = _resolve_dataset_path(context, invariant_path)
+        if path.exists():
+            entries.append({"path": path, "item": item, "status": item.get("status") or "warning"})
+    if entries:
+        return entries
+    return [
+        {"path": path, "item": {}, "status": "warning"}
+        for path in _invariant_paths(context)
+    ]
