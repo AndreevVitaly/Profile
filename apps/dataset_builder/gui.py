@@ -1,4 +1,4 @@
-﻿"""GUI Dataset Builder для платформы Profile."""
+"""GUI Dataset Builder для платформы Profile."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -53,6 +54,18 @@ class BuildWorker(QObject):
         copy_images: bool,
         dominant_face_track: bool,
         min_track_length: int,
+        min_video_height: int,
+        allow_quality_fallback: bool,
+        frame_selection_mode: str,
+        selection_profile: str,
+        target_selected_frames: int,
+        min_temporal_distance_seconds: float,
+        max_abs_yaw_deg: float,
+        max_abs_pitch_deg: float,
+        max_abs_roll_deg: float,
+        require_closed_mouth: bool,
+        require_open_eyes: bool,
+        use_gaze_score: bool,
     ) -> None:
         super().__init__()
         self.input_path = input_path
@@ -64,6 +77,18 @@ class BuildWorker(QObject):
         self.copy_images = copy_images
         self.dominant_face_track = dominant_face_track
         self.min_track_length = min_track_length
+        self.min_video_height = min_video_height
+        self.allow_quality_fallback = allow_quality_fallback
+        self.frame_selection_mode = frame_selection_mode
+        self.selection_profile = selection_profile
+        self.target_selected_frames = target_selected_frames
+        self.min_temporal_distance_seconds = min_temporal_distance_seconds
+        self.max_abs_yaw_deg = max_abs_yaw_deg
+        self.max_abs_pitch_deg = max_abs_pitch_deg
+        self.max_abs_roll_deg = max_abs_roll_deg
+        self.require_closed_mouth = require_closed_mouth
+        self.require_open_eyes = require_open_eyes
+        self.use_gaze_score = use_gaze_score
         self._stop = False
 
     @pyqtSlot()
@@ -79,6 +104,19 @@ class BuildWorker(QObject):
                 copy_images=self.copy_images,
                 dominant_face_track=self.dominant_face_track,
                 min_track_length=self.min_track_length,
+                video_quality="best",
+                min_video_height=self.min_video_height,
+                allow_quality_fallback=self.allow_quality_fallback,
+                frame_selection_mode=self.frame_selection_mode,
+                selection_profile=self.selection_profile,
+                target_selected_frames=self.target_selected_frames,
+                min_temporal_distance_seconds=self.min_temporal_distance_seconds,
+                max_abs_yaw_deg=self.max_abs_yaw_deg,
+                max_abs_pitch_deg=self.max_abs_pitch_deg,
+                max_abs_roll_deg=self.max_abs_roll_deg,
+                require_closed_mouth=self.require_closed_mouth,
+                require_open_eyes=self.require_open_eyes,
+                use_gaze_score=self.use_gaze_score,
                 log=self.log.emit,
                 progress=self._emit_progress,
                 should_stop=lambda: self._stop,
@@ -148,6 +186,36 @@ class MainWindow(QMainWindow):
         self.min_track_length = QSpinBox()
         self.min_track_length.setRange(1, 100000)
         self.min_track_length.setValue(3)
+        self.min_video_height = QSpinBox()
+        self.min_video_height.setRange(144, 4320)
+        self.min_video_height.setValue(720)
+        self.allow_quality_fallback = QCheckBox("если высокого качества нет, брать лучшее доступное")
+        self.allow_quality_fallback.setChecked(True)
+        self.frame_selection_mode = QComboBox()
+        self.frame_selection_mode.addItems(["fixed_step", "quality_profile"])
+        self.selection_profile = QComboBox()
+        self.selection_profile.addItems(["frontal_neutral"])
+        self.target_selected_frames = QSpinBox()
+        self.target_selected_frames.setRange(1, 100000)
+        self.target_selected_frames.setValue(100)
+        self.min_temporal_distance = QSpinBox()
+        self.min_temporal_distance.setRange(0, 60)
+        self.min_temporal_distance.setValue(1)
+        self.max_abs_yaw = QSpinBox()
+        self.max_abs_yaw.setRange(0, 90)
+        self.max_abs_yaw.setValue(15)
+        self.max_abs_pitch = QSpinBox()
+        self.max_abs_pitch.setRange(0, 90)
+        self.max_abs_pitch.setValue(12)
+        self.max_abs_roll = QSpinBox()
+        self.max_abs_roll.setRange(0, 90)
+        self.max_abs_roll.setValue(10)
+        self.require_closed_mouth = QCheckBox("исключать открытый рот")
+        self.require_closed_mouth.setChecked(True)
+        self.require_open_eyes = QCheckBox("требовать открытые глаза")
+        self.require_open_eyes.setChecked(True)
+        self.use_gaze_score = QCheckBox("использовать оценку взгляда")
+        self.use_gaze_score.setChecked(True)
         self.backend_mediapipe = QRadioButton("MediaPipe")
         self.backend_onnx = QRadioButton("ONNX")
         self.backend_mediapipe.setChecked(True)
@@ -174,6 +242,18 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("", self.copy_images)
         settings_layout.addRow("", self.dominant_face_track)
         settings_layout.addRow("Мин. повторов лица", self.min_track_length)
+        settings_layout.addRow("Мин. высота видео", self.min_video_height)
+        settings_layout.addRow("", self.allow_quality_fallback)
+        settings_layout.addRow("Режим выбора кадров", self.frame_selection_mode)
+        settings_layout.addRow("Профиль", self.selection_profile)
+        settings_layout.addRow("Целевое число кадров", self.target_selected_frames)
+        settings_layout.addRow("Мин. дистанция, сек", self.min_temporal_distance)
+        settings_layout.addRow("Порог yaw", self.max_abs_yaw)
+        settings_layout.addRow("Порог pitch", self.max_abs_pitch)
+        settings_layout.addRow("Порог roll", self.max_abs_roll)
+        settings_layout.addRow("", self.require_closed_mouth)
+        settings_layout.addRow("", self.require_open_eyes)
+        settings_layout.addRow("", self.use_gaze_score)
         settings_layout.addRow("Модель", model_row)
         settings_layout.addRow("Topology", topology_row)
         layout.addWidget(settings_box)
@@ -280,6 +360,18 @@ class MainWindow(QMainWindow):
             copy_images=self.copy_images.isChecked(),
             dominant_face_track=self.dominant_face_track.isChecked(),
             min_track_length=self.min_track_length.value(),
+            min_video_height=self.min_video_height.value(),
+            allow_quality_fallback=self.allow_quality_fallback.isChecked(),
+            frame_selection_mode=self.frame_selection_mode.currentText(),
+            selection_profile=self.selection_profile.currentText(),
+            target_selected_frames=self.target_selected_frames.value(),
+            min_temporal_distance_seconds=float(self.min_temporal_distance.value()),
+            max_abs_yaw_deg=float(self.max_abs_yaw.value()),
+            max_abs_pitch_deg=float(self.max_abs_pitch.value()),
+            max_abs_roll_deg=float(self.max_abs_roll.value()),
+            require_closed_mouth=self.require_closed_mouth.isChecked(),
+            require_open_eyes=self.require_open_eyes.isChecked(),
+            use_gaze_score=self.use_gaze_score.isChecked(),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)

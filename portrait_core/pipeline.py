@@ -1,4 +1,4 @@
-﻿"""Полный конвейер анализа одной фотографии."""
+"""Полный конвейер анализа одной фотографии."""
 
 from portrait_core.analyzer import analyze_points
 from portrait_core.canonical import canonicalize_mesh
@@ -17,7 +17,8 @@ def analyze_photo_with_adapter(image_path: str, adapter, input_metadata: dict | 
     canonical_mesh = canonicalize_mesh(mesh)
     zones = build_zone_definitions(canonical_mesh)
     zone_assignments = assign_vertices_to_zones(canonical_mesh, zones)
-    quality = assess_image_quality(image_path, points)
+    source_type = (input_metadata or {}).get("source_type")
+    quality = assess_image_quality(image_path, points, source_type=source_type)
     features = extract_dense_features(
         canonical_mesh,
         zone_assignments,

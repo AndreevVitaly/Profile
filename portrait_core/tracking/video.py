@@ -164,7 +164,7 @@ def _save_selected_track_crops(
             if observation is not None:
                 crop = _crop_with_padding(frame, observation.bbox, crop_padding)
                 output_path = target / f"{len(output_paths) + 1:04d}_track_{track_id}_frame{frame_index:06d}.jpg"
-                cv2.imwrite(str(output_path), crop)
+                _write_jpeg(output_path, crop)
                 output_paths.append(output_path)
                 wanted.remove(frame_index)
                 if log:
@@ -173,6 +173,21 @@ def _save_selected_track_crops(
     finally:
         capture.release()
     return output_paths
+
+def _write_jpeg(output_path: Path, image) -> None:
+    """Write JPEG through Python I/O so Windows handles Unicode paths reliably."""
+    try:
+        import cv2
+    except ImportError as error:
+        raise RuntimeError("opencv-contrib-python is required for video face-track selection") from error
+
+    ok, encoded = cv2.imencode(".jpg", image)
+    if not ok:
+        raise RuntimeError(f"Could not encode face-track crop: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(encoded.tobytes())
+    if not output_path.is_file():
+        raise RuntimeError(f"Could not write face-track crop: {output_path}")
 
 def _crop_with_padding(frame, bbox: tuple[float, float, float, float], padding: float):
     x, y, width, height = bbox

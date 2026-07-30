@@ -1,4 +1,4 @@
-﻿"""Тесты приложения Dataset Builder."""
+"""Тесты приложения Dataset Builder."""
 
 import hashlib
 import hashlib
@@ -126,40 +126,28 @@ class DatasetBuilderAppTestCase(unittest.TestCase):
         self.assertEqual(extract_mock.call_args.args[2], 12)
 
 
-    @patch("apps.dataset_builder.builder._is_readable_video")
-    @patch("apps.dataset_builder.builder.subprocess.Popen")
-    def test_download_prefers_readable_mp4_over_newer_webm(self, popen_mock, readable_mock):
-        class FakeStdout:
-            def __iter__(self):
-                return iter(["[download] 100%"])
-
-        class FakeProcess:
-            stdout = FakeStdout()
-
-            def wait(self):
-                return 0
-
-            def poll(self):
-                return 0
-
-            def terminate(self):
-                return None
-
-        popen_mock.return_value = FakeProcess()
-        readable_mock.side_effect = lambda path: path.suffix.lower() == ".mp4"
+    @patch("apps.dataset_builder.builder.download_best_video_source")
+    def test_download_video_source_uses_best_video_selector(self, download_mock):
         with tempfile.TemporaryDirectory() as directory:
             from apps.dataset_builder.builder import download_video_source
+            from apps.dataset_builder.video_source import VideoDownloadResult
 
             root = Path(directory)
-            token = hashlib.sha256(b"https://example.com/video").hexdigest()[:12]
-            mp4 = root / f"source-{token}.f399.mp4"
-            webm = root / f"source-{token}.f251.webm"
-            mp4.write_bytes(b"video")
-            webm.write_bytes(b"audio")
+            selected_video = root / "selected.mp4"
+            selected_video.write_bytes(b"video")
+            download_mock.return_value = VideoDownloadResult(
+                selected_video,
+                {"selected_format_id": "137", "height": 1080, "verified": True},
+            )
 
-            selected = download_video_source("https://example.com/video", root)
+            selected = download_video_source(
+                "https://example.com/video",
+                root,
+                min_video_height=1080,
+            )
 
-        self.assertEqual(selected.name, mp4.name)
+        self.assertEqual(selected, selected_video)
+        self.assertEqual(download_mock.call_args.kwargs["min_video_height"], 1080)
 
 if __name__ == "__main__":
     unittest.main()

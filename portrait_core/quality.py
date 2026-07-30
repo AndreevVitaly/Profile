@@ -17,7 +17,7 @@ def _angle_degrees(point_a, point_b) -> float:
     )
 
 
-def assess_image_quality(image_path: str, points: dict) -> dict:
+def assess_image_quality(image_path: str, points: dict, *, source_type: str | None = None) -> dict:
     """Оценить геометрию головы, резкость, свет и размер лица."""
     with Image.open(Path(image_path)) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
@@ -84,20 +84,37 @@ def assess_image_quality(image_path: str, points: dict) -> dict:
         ),
         "resolution": min(image.size) >= thresholds["min_source_dimension"],
     }
+    resolution_code = (
+        "source_video_resolution_low"
+        if source_type == "video_frame"
+        else "source_image_resolution_low"
+    )
+    issue_codes = {
+        "head_roll": "head_roll",
+        "head_yaw": "head_yaw",
+        "sharpness": "frame_blur",
+        "brightness": "brightness",
+        "contrast": "contrast",
+        "face_size": "face_effective_resolution_low",
+        "neutral_expression": "neutral_expression",
+        "resolution": resolution_code,
+    }
     labels = {
         "head_roll": "сильный наклон головы",
         "head_yaw": "лицо заметно повернуто",
-        "sharpness": "фотография размыта",
+        "sharpness": "frame_blur",
         "brightness": "неподходящая яркость",
         "contrast": "низкий контраст",
-        "face_size": "лицо занимает слишком малую часть кадра",
+        "face_size": "face_effective_resolution_low",
         "neutral_expression": "рот заметно открыт; требуется нейтральное выражение",
-        "resolution": "низкое исходное разрешение фотографии",
+        "resolution": resolution_code,
     }
     issues = [labels[name] for name, passed in checks.items() if not passed]
+    codes = [issue_codes[name] for name, passed in checks.items() if not passed]
     return {
         "status": "passed" if not issues else "warning",
         "issues": issues,
+        "issue_codes": codes,
         "checks": checks,
         "metrics": {
             "roll_degrees": roll_degrees,
@@ -106,6 +123,9 @@ def assess_image_quality(image_path: str, points: dict) -> dict:
             "brightness": brightness,
             "contrast": contrast,
             "face_coverage": face_coverage,
+            "face_width_px": face_width,
+            "face_height_px": face_height,
+            "face_area_ratio": face_coverage,
             "mouth_opening_ratio": mouth_opening_ratio,
             "source_width": image.width,
             "source_height": image.height,

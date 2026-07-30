@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlparse
@@ -21,6 +22,8 @@ from urllib.parse import urlparse
 from portrait_core import create_portrait_report
 from portrait_core.archive.common import as_posix, make_record_id, new_uuid, write_json
 from portrait_core.archive.dataset import create_dataset_archive, write_dataset_files
+from apps.dataset_builder.frame_selection import FrontalNeutralThresholds, SelectionConfig, select_quality_profile_frames
+from apps.dataset_builder.video_source import download_best_video_source, probe_video
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -33,6 +36,14 @@ StopCallback = Callable[[], bool]
 
 class StopRequested(RuntimeError):
     """Остановка сборки датасета по запросу пользователя."""
+
+
+@dataclass
+class InputMediaCollection:
+    images: list[Path]
+    source_media: dict | None = None
+    dataset_warnings: list[str] | None = None
+    selection: dict | None = None
 
 
 def _iter_images(path: Path) -> Iterable[Path]:
@@ -55,96 +66,22 @@ def download_video_source(
     url: str,
     downloads_dir: Path,
     *,
+    video_quality: str = "best",
+    min_video_height: int = 720,
+    allow_quality_fallback: bool = True,
     log: LogCallback | None = None,
     should_stop: StopCallback | None = None,
 ) -> Path:
-    if should_stop and should_stop():
-        raise StopRequested("Остановлено пользователем")
-
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-    token = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    output_template = downloads_dir / f"source-{token}.%(ext)s"
-    command = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--no-playlist",
-        "--newline",
-        "--progress",
-        "--socket-timeout",
-        "30",
-        "--retries",
-        "3",
-        "-f",
-        "bestvideo[height<=720][ext=mp4]/best[height<=720][ext=mp4]/bestvideo[height<=720]/best[height<=720]/bestvideo[ext=mp4]/bestvideo/best",
-        "-o",
-        str(output_template),
+    result = download_best_video_source(
         url,
-    ]
-    if log:
-        log(f"Скачивание видео по URL: {url}")
-
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        downloads_dir,
+        video_quality=video_quality,
+        min_video_height=min_video_height,
+        allow_quality_fallback=allow_quality_fallback,
+        log=log,
+        should_stop=should_stop,
     )
-    output_lines: list[str] = []
-    try:
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
-            if line:
-                output_lines.append(line)
-                if log:
-                    log(line)
-            if should_stop and should_stop():
-                process.terminate()
-                raise StopRequested("Остановлено пользователем")
-        return_code = process.wait()
-    finally:
-        if process.poll() is None:
-            process.terminate()
-
-    if return_code != 0:
-        output = "\n".join(output_lines[-20:]).strip()
-        if "No module named yt_dlp" in output:
-            raise RuntimeError(
-                "Для скачивания URL требуется yt-dlp. Установите зависимости: "
-                "python -m pip install -r requirements.txt"
-            )
-        raise RuntimeError(f"Не удалось скачать видео по URL: {output or url}")
-
-    candidates = sorted(
-        (
-            path
-            for path in downloads_dir.glob(f"source-{token}.*")
-            if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
-        ),
-        key=lambda path: (path.suffix.lower() != ".mp4", -path.stat().st_mtime),
-    )
-    for candidate in candidates:
-        if not _is_readable_video(candidate):
-            if log:
-                log(f"Пропуск не-видео потока: {candidate.name}")
-            continue
-        write_json(
-            downloads_dir / f"source-{token}.json",
-            {
-                "source_url": url,
-                "downloaded_path": str(candidate),
-                "tool": "yt-dlp",
-                "format": "video-only mp4 up to 720p preferred",
-            },
-        )
-        if log:
-            log(f"Видео скачано: {candidate.name}")
-        return candidate
-
-    raise RuntimeError("Видео скачано, но итоговый видеофайл не найден.")
+    return result.path
 
 
 def _is_readable_video(path: Path) -> bool:
@@ -164,6 +101,22 @@ def _is_readable_video(path: Path) -> bool:
         return bool(ok)
     finally:
         capture.release()
+
+
+def _write_cv_image(output_path: Path, image) -> None:
+    """Write an OpenCV image using Python file I/O for Unicode Windows paths."""
+    try:
+        import cv2
+    except ImportError as error:
+        raise RuntimeError("Для извлечения кадров из видео требуется opencv-contrib-python") from error
+
+    ok, encoded = cv2.imencode(output_path.suffix.lower() or ".jpg", image)
+    if not ok:
+        raise RuntimeError(f"Не удалось закодировать изображение: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(encoded.tobytes())
+    if not output_path.is_file():
+        raise RuntimeError(f"Не удалось записать изображение: {output_path}")
 
 def _extract_video_frames(
     video_path: Path,
@@ -197,7 +150,7 @@ def _extract_video_frames(
                 break
             if frame_index % frame_step == 0:
                 frame_path = frames_dir / f"frame{frame_index:06d}.jpg"
-                cv2.imwrite(str(frame_path), frame)
+                _write_cv_image(frame_path, frame)
                 frame_paths.append(frame_path)
                 if log:
                     log(f"Кадр извлечен: {frame_path.name}")
@@ -205,6 +158,162 @@ def _extract_video_frames(
     finally:
         capture.release()
     return frame_paths
+
+
+def _local_video_source_media(path: Path, *, min_video_height: int) -> dict:
+    probe = probe_video(path, selected_format_id="local")
+    width = int(probe.get("width") or 0)
+    height = int(probe.get("height") or 0)
+    warnings = []
+    if height and height < min_video_height:
+        warnings.append(
+            f"source_video_resolution_low: requested >= {min_video_height}p, actual {width}x{height}"
+        )
+    return {
+        "requested_quality": "local_file",
+        "selected_format_id": "local",
+        "width": width,
+        "height": height,
+        "fps": float(probe.get("fps") or 0.0),
+        "codec": str(probe.get("codec") or ""),
+        "bitrate": int(probe.get("bitrate") or 0),
+        "duration": float(probe.get("duration") or 0.0),
+        "download_strategy": "local_file",
+        "verified": bool(probe.get("verified")),
+        "verification_tool": probe.get("verification_tool"),
+        "transcoded": False,
+        "transcode": None,
+        "min_video_height": min_video_height,
+        "warnings": warnings,
+    }
+
+
+def collect_input_media(
+    input_path: str,
+    output_dir: str,
+    frame_step: int = 24,
+    *,
+    dominant_face_track: bool = False,
+    min_track_length: int = 3,
+    video_quality: str = "best",
+    min_video_height: int = 720,
+    allow_quality_fallback: bool = True,
+    frame_selection_mode: str = "fixed_step",
+    selection_profile: str = "frontal_neutral",
+    target_selected_frames: int = 100,
+    min_temporal_distance_seconds: float = 0.5,
+    max_frames_per_episode: int = 3,
+    max_abs_yaw_deg: float = 15.0,
+    max_abs_pitch_deg: float = 12.0,
+    max_abs_roll_deg: float = 10.0,
+    require_closed_mouth: bool = True,
+    require_open_eyes: bool = True,
+    use_gaze_score: bool = True,    log: LogCallback | None = None,
+    should_stop: StopCallback | None = None,
+) -> InputMediaCollection:
+    """Return images plus optional verified source-media metadata."""
+    source_media = None
+    dataset_warnings: list[str] = []
+    if is_url(input_path):
+        download = download_best_video_source(
+            input_path,
+            Path(output_dir) / "downloads",
+            video_quality=video_quality,
+            min_video_height=min_video_height,
+            allow_quality_fallback=allow_quality_fallback,
+            log=log,
+            should_stop=should_stop,
+        )
+        source = download.path
+        source_media = download.source_media
+        dataset_warnings.extend(source_media.get("warnings", []))
+    else:
+        source = Path(input_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Источник не найден: {source}")
+    if source.is_file() and source.suffix.lower() in VIDEO_SUFFIXES:
+        if source_media is None:
+            source_media = _local_video_source_media(
+                source,
+                min_video_height=min_video_height,
+            )
+            dataset_warnings.extend(source_media.get("warnings", []))
+        if log:
+            log(f"Извлечение кадров из видео: {source}")
+            if source_media:
+                log(
+                    "source_media: "
+                    f"{source_media.get('width')}x{source_media.get('height')}, "
+                    f"{source_media.get('fps', 0):g} fps, "
+                    f"format {source_media.get('selected_format_id')}"
+                )
+        if frame_selection_mode == "quality_profile":
+            thresholds = FrontalNeutralThresholds(
+                max_abs_yaw_deg=max_abs_yaw_deg,
+                max_abs_pitch_deg=max_abs_pitch_deg,
+                max_abs_roll_deg=max_abs_roll_deg,
+            )
+            config = SelectionConfig(
+                profile=selection_profile,
+                target_selected_frames=target_selected_frames,
+                min_temporal_distance_seconds=min_temporal_distance_seconds,
+                max_frames_per_episode=max_frames_per_episode,
+                use_gaze_score=use_gaze_score,
+                require_closed_mouth=require_closed_mouth,
+                require_open_eyes=require_open_eyes,
+                thresholds=thresholds,
+            )
+            result = select_quality_profile_frames(
+                source,
+                Path(output_dir) / "quality_profile",
+                config=config,
+                scan_step=1,
+                log=log,
+                should_stop=should_stop,
+            )
+            if not result.images:
+                raise ValueError("Quality profile did not select any usable frames")
+            return InputMediaCollection(
+                result.images,
+                source_media,
+                dataset_warnings,
+                result.selection,
+            )
+        if dominant_face_track:
+            from portrait_core.tracking import select_dominant_face_track
+
+            selected = select_dominant_face_track(
+                source,
+                Path(output_dir) / "dominant_face_track",
+                frame_step=max(1, frame_step),
+                min_track_length=min_track_length,
+                log=log,
+                should_stop=should_stop,
+            )
+            if not selected:
+                raise ValueError("Dominant geometry-only face-track was not found in video")
+            return InputMediaCollection(selected, source_media, dataset_warnings)
+        selection = {
+            "mode": "fixed_step",
+            "profile": None,
+            "frame_step": max(1, frame_step),
+        }
+        return InputMediaCollection(
+            _extract_video_frames(
+                source,
+                Path(output_dir) / "frames",
+                max(1, frame_step),
+                log=log,
+                should_stop=should_stop,
+            ),
+            source_media,
+            dataset_warnings,
+            selection,
+        )
+    images = list(_iter_images(source))
+    if not images:
+        raise ValueError(f"В источнике нет поддерживаемых изображений: {source}")
+    return InputMediaCollection(images, source_media, dataset_warnings)
 
 
 def collect_input_images(
@@ -300,6 +409,41 @@ def _ensure_pfr_identity(report: dict, dataset_id: str) -> tuple[str, str]:
     return pfr_id, pfr_uuid
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return float(ordered[lower] * (1 - fraction) + ordered[upper] * fraction)
+
+
+def _face_resolution_stats(samples: list[dict]) -> dict:
+    widths = [float(item["face_width_px"]) for item in samples if item.get("face_width_px") is not None]
+    heights = [float(item["face_height_px"]) for item in samples if item.get("face_height_px") is not None]
+    areas = [float(item["face_area_ratio"]) for item in samples if item.get("face_area_ratio") is not None]
+    return {
+        "samples": len(samples),
+        "median_face_width_px": _percentile(widths, 0.5),
+        "median_face_height_px": _percentile(heights, 0.5),
+        "p10_face_width_px": _percentile(widths, 0.1),
+        "p10_face_height_px": _percentile(heights, 0.1),
+        "median_face_area_ratio": _percentile(areas, 0.5),
+    }
+
+
+def _quality_issue_codes(report: dict) -> list[str]:
+    quality = report.get("quality") or {}
+    codes = quality.get("issue_codes") or []
+    if isinstance(codes, list):
+        return [str(item) for item in codes]
+    return [str(codes)]
+
+
 def build_dataset(
     input_path: str,
     output_dir: str,
@@ -312,7 +456,20 @@ def build_dataset(
     build_invariants: bool = False,
     dominant_face_track: bool = False,
     min_track_length: int = 3,
-    log: LogCallback | None = None,
+    video_quality: str = "best",
+    min_video_height: int = 720,
+    allow_quality_fallback: bool = True,
+    frame_selection_mode: str = "fixed_step",
+    selection_profile: str = "frontal_neutral",
+    target_selected_frames: int = 100,
+    min_temporal_distance_seconds: float = 0.5,
+    max_frames_per_episode: int = 3,
+    max_abs_yaw_deg: float = 15.0,
+    max_abs_pitch_deg: float = 12.0,
+    max_abs_roll_deg: float = 10.0,
+    require_closed_mouth: bool = True,
+    require_open_eyes: bool = True,
+    use_gaze_score: bool = True,    log: LogCallback | None = None,
     progress: ProgressCallback | None = None,
     should_stop: StopCallback | None = None,
 ) -> dict:
@@ -326,6 +483,9 @@ def build_dataset(
         "build_invariants": build_invariants,
         "dominant_face_track": dominant_face_track,
         "min_track_length": min_track_length,
+        "video_quality": video_quality,
+        "min_video_height": min_video_height,
+        "allow_quality_fallback": allow_quality_fallback,
     }
     dataset_dir, dataset = create_dataset_archive(
         output_dir,
@@ -336,16 +496,39 @@ def build_dataset(
         log(f"Источник: {input_path}")
         log(f"Dataset Archive: {dataset_dir}")
 
-    images = collect_input_images(
+    collection = collect_input_media(
         input_path,
         str(dataset_dir / "_frames"),
         frame_step=frame_step,
         dominant_face_track=dominant_face_track,
         min_track_length=min_track_length,
+        video_quality=video_quality,
+        min_video_height=min_video_height,
+        allow_quality_fallback=allow_quality_fallback,
+        frame_selection_mode=frame_selection_mode,
+        selection_profile=selection_profile,
+        target_selected_frames=target_selected_frames,
+        min_temporal_distance_seconds=min_temporal_distance_seconds,
+        max_frames_per_episode=max_frames_per_episode,
+        max_abs_yaw_deg=max_abs_yaw_deg,
+        max_abs_pitch_deg=max_abs_pitch_deg,
+        max_abs_roll_deg=max_abs_roll_deg,
+        require_closed_mouth=require_closed_mouth,
+        require_open_eyes=require_open_eyes,
+        use_gaze_score=use_gaze_score,
         log=log,
         should_stop=should_stop,
     )
+    images = collection.images
+    dataset_warnings = list(collection.dataset_warnings or [])
+    if collection.source_media:
+        dataset["source_media"] = collection.source_media
+    if collection.selection:
+        dataset["selection"] = collection.selection
+    if dataset_warnings:
+        dataset["warnings"] = dataset_warnings
     rows = []
+    face_resolution_samples = []
     total = len(images)
     if log:
         log(f"К анализу изображений: {total}")
@@ -370,6 +553,7 @@ def build_dataset(
             "invariants_path": None,
             "status": "rejected",
             "issues": [],
+            "issue_codes": [],
             "source_frame": image_path.name,
             "frame_index": frame_index,
             "timestamp_seconds": _timestamp_seconds(frame_index, frame_step),
@@ -390,6 +574,16 @@ def build_dataset(
                 },
             )
             status, issues = _quality_status(report)
+            issue_codes = _quality_issue_codes(report)
+            metrics = (report.get("quality") or {}).get("metrics") or {}
+            if metrics.get("face_width_px") is not None and metrics.get("face_height_px") is not None:
+                face_resolution_samples.append(
+                    {
+                        "face_width_px": metrics.get("face_width_px"),
+                        "face_height_px": metrics.get("face_height_px"),
+                        "face_area_ratio": metrics.get("face_area_ratio"),
+                    }
+                )
             pfr_id, pfr_uuid = _ensure_pfr_identity(report, dataset["id"])
             pfr_path = dataset_dir / "pfr" / f"{Path(item['image_path']).stem}_portrait.json"
             write_json(pfr_path, report)
@@ -397,28 +591,27 @@ def build_dataset(
             if build_invariants:
                 from portrait_core.invariants import build_invariants_for_portrait
 
-                invariants_path = (
-                    dataset_dir / "invariants" / f"{pfr_path.stem}_invariants.json"
-                )
+                invariants_path = dataset_dir / "invariants" / f"{pfr_path.stem}_invariants.json"
                 build_invariants_for_portrait(pfr_path, invariants_path)
             item.update(
                 {
                     "pfr_id": pfr_id,
                     "pfr_uuid": pfr_uuid,
                     "pfr_path": as_posix(pfr_path, dataset_dir),
-                    "invariants_path": (
-                        as_posix(invariants_path, dataset_dir)
-                        if invariants_path is not None
-                        else None
-                    ),
+                    "invariants_path": as_posix(invariants_path, dataset_dir) if invariants_path is not None else None,
                     "status": status,
                     "issues": issues,
+                    "issue_codes": issue_codes,
+                    "face_width_px": metrics.get("face_width_px"),
+                    "face_height_px": metrics.get("face_height_px"),
+                    "face_area_ratio": metrics.get("face_area_ratio"),
                 }
             )
             if log:
                 log(f"{status}: {image_path.name}")
         except Exception as error:  # noqa: BLE001 - Dataset Builder должен продолжать серию.
             item["issues"] = [str(error)]
+            item["issue_codes"] = ["analysis_error"]
             if log:
                 log(f"rejected: {image_path.name}: {error}")
 
@@ -429,6 +622,10 @@ def build_dataset(
                 "report": item["pfr_path"],
                 "status": item["status"],
                 "issues": "; ".join(item["issues"]),
+                "issue_codes": item.get("issue_codes", []),
+                "face_width_px": item.get("face_width_px"),
+                "face_height_px": item.get("face_height_px"),
+                "face_area_ratio": item.get("face_area_ratio"),
                 "pfr_id": item["pfr_id"],
                 "pfr_uuid": item["pfr_uuid"],
             }
@@ -436,6 +633,8 @@ def build_dataset(
         if progress:
             progress(index, total)
 
+    face_resolution = _face_resolution_stats(face_resolution_samples)
+    dataset["face_effective_resolution"] = face_resolution
     write_dataset_files(dataset_dir, dataset)
     summary = {
         "schema": "profile-dataset-builder/2",
@@ -452,6 +651,10 @@ def build_dataset(
         },
         "rows": rows,
         "items": dataset["items"],
+        "source_media": dataset.get("source_media"),
+        "selection": dataset.get("selection"),
+        "dataset_warnings": dataset.get("warnings", []),
+        "face_effective_resolution": face_resolution,
         "architecture": {
             "application": "apps.dataset_builder",
             "scientific_engine": "portrait_core",
@@ -472,6 +675,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", dest="model_path")
     parser.add_argument("--topology", dest="topology_path")
     parser.add_argument("--frame-step", type=int, default=24)
+    parser.add_argument("--video-quality", choices=("best",), default="best")
+    parser.add_argument("--min-video-height", type=int, default=720)
+    parser.add_argument("--frame-selection-mode", choices=("fixed_step", "quality_profile"), default="fixed_step")
+    parser.add_argument("--selection-profile", choices=("frontal_neutral",), default="frontal_neutral")
+    parser.add_argument("--target-selected-frames", type=int, default=100)
+    parser.add_argument("--min-temporal-distance-seconds", type=float, default=0.5)
+    parser.add_argument("--max-frames-per-episode", type=int, default=3)
+    parser.add_argument("--max-abs-yaw-deg", type=float, default=15.0)
+    parser.add_argument("--max-abs-pitch-deg", type=float, default=12.0)
+    parser.add_argument("--max-abs-roll-deg", type=float, default=10.0)
+    parser.add_argument("--require-closed-mouth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--require-open-eyes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-gaze-score", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--allow-quality-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow falling back below the requested minimum when no better decodable source exists",
+    )
     parser.add_argument(
         "--dominant-face-track",
         action="store_true",
@@ -505,6 +727,20 @@ def main() -> None:
         build_invariants=args.build_invariants,
         dominant_face_track=args.dominant_face_track,
         min_track_length=args.min_track_length,
+        video_quality=args.video_quality,
+        min_video_height=args.min_video_height,
+        allow_quality_fallback=args.allow_quality_fallback,
+        frame_selection_mode=args.frame_selection_mode,
+        selection_profile=args.selection_profile,
+        target_selected_frames=args.target_selected_frames,
+        min_temporal_distance_seconds=args.min_temporal_distance_seconds,
+        max_frames_per_episode=args.max_frames_per_episode,
+        max_abs_yaw_deg=args.max_abs_yaw_deg,
+        max_abs_pitch_deg=args.max_abs_pitch_deg,
+        max_abs_roll_deg=args.max_abs_roll_deg,
+        require_closed_mouth=args.require_closed_mouth,
+        require_open_eyes=args.require_open_eyes,
+        use_gaze_score=args.use_gaze_score,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
