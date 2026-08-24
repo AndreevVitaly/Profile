@@ -30,6 +30,7 @@ class ProfileEngineContext:
             "invariants_dir": self.dataset_path / "invariants",
             "experiments_dir": self.dataset_path / "experiments",
             "report_pack_dir": self.dataset_path / "experiments",
+            "reconstruction_3d_dir": self.dataset_path / "reconstruction_3d",
         }
         if self.paths["dataset_json"].exists():
             try:

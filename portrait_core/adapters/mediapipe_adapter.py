@@ -24,6 +24,17 @@ class ImageQualityError(FaceAdapterError):
     """Изображение не соответствует минимальным требованиям."""
 
 
+class _BorrowedLandmarker:
+    def __init__(self, landmarker):
+        self.landmarker = landmarker
+
+    def __enter__(self):
+        return self.landmarker
+
+    def __exit__(self, *_exc):
+        return False
+
+
 class MediaPipeAdapter(FacePointAdapter):
     """Преобразовать сетку MediaPipe в контракт измерительного ядра."""
 
@@ -63,6 +74,30 @@ class MediaPipeAdapter(FacePointAdapter):
         self.min_detection_confidence = min_detection_confidence
         self.min_presence_confidence = min_presence_confidence
         self.min_image_size = min_image_size
+        self._landmarker = None
+        self._mp = None
+
+    def prepare(self) -> None:
+        if self._landmarker is not None:
+            return
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"Модель MediaPipe не найдена: {self.model_path}")
+        mp = self._load_mediapipe()
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_buffer=self.model_path.read_bytes()),
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_faces=2,
+            min_face_detection_confidence=self.min_detection_confidence,
+            min_face_presence_confidence=self.min_presence_confidence,
+        )
+        self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+        self._mp = mp
+
+    def close(self) -> None:
+        if self._landmarker is not None:
+            self._landmarker.close()
+            self._landmarker = None
+            self._mp = None
 
     @staticmethod
     def _load_mediapipe():
@@ -170,7 +205,8 @@ class MediaPipeAdapter(FacePointAdapter):
 
         from PIL import Image, ImageOps
 
-        mp = self._load_mediapipe()
+        self.prepare()
+        mp = self._mp
         with Image.open(image_file) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
 
@@ -189,17 +225,7 @@ class MediaPipeAdapter(FacePointAdapter):
                 Image.Resampling.LANCZOS,
             )
 
-        options = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(
-                model_asset_buffer=self.model_path.read_bytes()
-            ),
-            running_mode=mp.tasks.vision.RunningMode.IMAGE,
-            num_faces=2,
-            min_face_detection_confidence=self.min_detection_confidence,
-            min_face_presence_confidence=self.min_presence_confidence,
-        )
-
-        with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
+        with _BorrowedLandmarker(self._landmarker) as landmarker:
             for left, top, right, bottom in self._candidate_regions(*image.size):
                 crop = image.crop((left, top, right, bottom))
                 result = landmarker.detect(self._to_mp_image(mp, crop))

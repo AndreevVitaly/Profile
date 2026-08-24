@@ -126,18 +126,22 @@ class DatasetBuilderAppTestCase(unittest.TestCase):
         self.assertEqual(extract_mock.call_args.args[2], 12)
 
 
-    @patch("apps.dataset_builder.builder.download_best_video_source")
-    def test_download_video_source_uses_best_video_selector(self, download_mock):
+    @patch("apps.dataset_builder.builder.VideoSourceManager.resolve")
+    def test_download_video_source_uses_video_source_manager(self, resolve_mock):
         with tempfile.TemporaryDirectory() as directory:
             from apps.dataset_builder.builder import download_video_source
-            from apps.dataset_builder.video_source import VideoDownloadResult
+            from apps.dataset_builder.video_sources import UnifiedVideoAsset
 
             root = Path(directory)
             selected_video = root / "selected.mp4"
             selected_video.write_bytes(b"video")
-            download_mock.return_value = VideoDownloadResult(
-                selected_video,
-                {"selected_format_id": "137", "height": 1080, "verified": True},
+            resolve_mock.return_value = UnifiedVideoAsset(
+                source_type="youtube",
+                adapter="YouTubeAdapter",
+                original_source="https://example.com/video",
+                downloaded_file=selected_video,
+                height=1080,
+                verified=True,
             )
 
             selected = download_video_source(
@@ -147,7 +151,7 @@ class DatasetBuilderAppTestCase(unittest.TestCase):
             )
 
         self.assertEqual(selected, selected_video)
-        self.assertEqual(download_mock.call_args.kwargs["min_video_height"], 1080)
+        self.assertEqual(resolve_mock.call_args.kwargs["min_video_height"], 1080)
 
 if __name__ == "__main__":
     unittest.main()

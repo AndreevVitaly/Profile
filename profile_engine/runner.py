@@ -16,10 +16,34 @@ def run_profile_engine(
 ) -> dict[str, Any]:
     context = ProfileEngineContext(Path(dataset_path), config=config or {})
     status = "completed"
+    dataset = context.read_dataset()
+    items = list(dataset.get("items") or [])
+    systemic_failure = bool(items) and not any(item.get("pfr_path") for item in items) and all(
+        "analysis_error" in (item.get("issue_codes") or []) for item in items
+    )
+    if systemic_failure:
+        message = "Dataset is not ready: no PFR was created because of a model/backend system failure"
+        context.add_error(message)
+        manifest_path = write_manifest(context, status="not_ready")
+        return {"status": "not_ready", "run_id": context.run_id, "dataset_id": context.dataset_id,
+                "manifest_path": str(manifest_path), "warnings": context.warnings,
+                "errors": context.errors, "artifacts": context.artifacts, "stages": context.stages}
 
     try:
         selected = _selected_stage_names(context.config.get("stages"))
-        for stage in default_stages():
+        reconstruction_names = {
+            "select_3d_frames",
+            "build_canonical_3d",
+            "validate_canonical_3d",
+            "build_standardized_projections",
+            "build_3d_measurements",
+            "compare_2d_3d",
+        }
+        include_reconstruction = bool(
+            context.config.get("include_reconstruction_3d")
+            or (selected is not None and selected & reconstruction_names)
+        )
+        for stage in default_stages(include_reconstruction_3d=include_reconstruction):
             if selected is not None and stage.name not in selected:
                 continue
             try:

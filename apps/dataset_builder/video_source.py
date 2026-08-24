@@ -12,10 +12,20 @@ from pathlib import Path
 from typing import Callable
 
 
-VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+VIDEO_SUFFIXES = {
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".mpeg", ".mpg", ".m4v", ".ts", ".flv", ".ogv",
+}
 QUALITY_FALLBACK_HEIGHTS = (2160, 1440, 1080, 720)
 LogCallback = Callable[[str], None]
 StopCallback = Callable[[], bool]
+NetworkWaitCallback = Callable[[dict], bool]
+NetworkRecoveredCallback = Callable[[], None]
+HttpHeaders = dict[str, str]
+
+
+class NetworkDownloadError(RuntimeError):
+    """A retryable connectivity failure reported by yt-dlp."""
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,15 @@ class VideoDownloadResult:
     source_media: dict
 
 
+def _http_header_args(headers: HttpHeaders | None) -> list[str]:
+    args: list[str] = []
+    for name, value in (headers or {}).items():
+        if "\n" in name or "\r" in name or "\n" in value or "\r" in value:
+            raise ValueError("HTTP header contains a newline")
+        args.extend(("--add-header", f"{name}:{value}"))
+    return args
+
+
 def download_best_video_source(
     url: str,
     downloads_dir: Path,
@@ -47,6 +66,10 @@ def download_best_video_source(
     allow_quality_fallback: bool = True,
     log: LogCallback | None = None,
     should_stop: StopCallback | None = None,
+    network_wait: NetworkWaitCallback | None = None,
+    network_recovered: NetworkRecoveredCallback | None = None,
+    http_headers: HttpHeaders | None = None,
+    no_check_certificates: bool = False,
 ) -> VideoDownloadResult:
     """Download the best decodable video-only stream with sequential fallback."""
     if should_stop and should_stop():
@@ -54,8 +77,22 @@ def download_best_video_source(
 
     downloads_dir.mkdir(parents=True, exist_ok=True)
     token = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    info = _fetch_video_info(url, log=log, should_stop=should_stop)
-    candidates = _rank_video_formats(info.get("formats") or [])
+    info_attempt = 0
+    while True:
+        try:
+            info = _fetch_video_info(url, log=log, should_stop=should_stop, http_headers=http_headers, no_check_certificates=no_check_certificates)
+            if info_attempt and network_recovered:
+                network_recovered()
+            break
+        except NetworkDownloadError as error:
+            info_attempt += 1
+            if not _wait_for_network(
+                error, phase="metadata", attempt=info_attempt, url=url,
+                downloads_dir=downloads_dir, network_wait=network_wait,
+                should_stop=should_stop,
+            ):
+                raise RuntimeError("Остановлено пользователем") from error
+    candidates = _rank_video_formats(info.get("formats") or [info])
     if not candidates:
         raise RuntimeError("yt-dlp не вернул пригодные видеопотоки")
 
@@ -79,7 +116,21 @@ def download_best_video_source(
                     f"{candidate.format_id}: {candidate.width}x{candidate.height}, "
                     f"{candidate.fps:g} fps, {candidate.codec}"
                 )
-            path = _download_format(url, downloads_dir, token, candidate, log, should_stop)
+            download_attempt = 0
+            while True:
+                try:
+                    path = _download_format(url, downloads_dir, token, candidate, log, should_stop, http_headers, no_check_certificates)
+                    if download_attempt and network_recovered:
+                        network_recovered()
+                    break
+                except NetworkDownloadError as error:
+                    download_attempt += 1
+                    if not _wait_for_network(
+                        error, phase="download", attempt=download_attempt, url=url,
+                        downloads_dir=downloads_dir, network_wait=network_wait,
+                        should_stop=should_stop,
+                    ):
+                        raise RuntimeError("Остановлено пользователем") from error
             if not _is_readable_video(path):
                 raise RuntimeError("скачанный файл не декодируется OpenCV")
             verified = probe_video(path, selected_format_id=candidate.format_id)
@@ -131,13 +182,21 @@ def _fetch_video_info(
     *,
     log: LogCallback | None = None,
     should_stop: StopCallback | None = None,
+    http_headers: HttpHeaders | None = None,
+    no_check_certificates: bool = False,
 ) -> dict:
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
         "--no-playlist",
+        "--socket-timeout",
+        "15",
+        "--retries",
+        "0",
         "--dump-single-json",
+        *(["--no-check-certificates"] if no_check_certificates else []),
+        *_http_header_args(http_headers),
         url,
     ]
     if log:
@@ -159,14 +218,17 @@ def _fetch_video_info(
             raise RuntimeError(
                 "Для скачивания URL требуется yt-dlp. Выполните: python -m pip install -r requirements.txt"
             )
-        raise RuntimeError(stderr.strip() or "yt-dlp не смог получить список форматов")
+        message = stderr.strip() or "yt-dlp metadata request failed"
+        if _is_network_error(message):
+            raise NetworkDownloadError(message)
+        raise RuntimeError(message)
     return json.loads(stdout)
 
 
 def _rank_video_formats(formats: list[dict]) -> list[VideoFormatCandidate]:
     candidates = []
     for item in formats:
-        if item.get("vcodec") in (None, "none"):
+        if item.get("vcodec") == "none":
             continue
         width = _as_int(item.get("width"))
         height = _as_int(item.get("height"))
@@ -182,7 +244,7 @@ def _rank_video_formats(formats: list[dict]) -> list[VideoFormatCandidate]:
                 height=height,
                 fps=_as_float(item.get("fps")),
                 bitrate=_as_int(item.get("vbr") or item.get("tbr") or item.get("abr")),
-                codec=str(item.get("vcodec") or ""),
+                codec=str(item.get("vcodec") or "unknown"),
                 ext=str(item.get("ext") or ""),
                 protocol=str(item.get("protocol") or ""),
                 is_upscaled=_looks_upscaled(item),
@@ -225,6 +287,8 @@ def _download_format(
     candidate: VideoFormatCandidate,
     log: LogCallback | None,
     should_stop: StopCallback | None,
+    http_headers: HttpHeaders | None = None,
+    no_check_certificates: bool = False,
 ) -> Path:
     safe_format = _safe_name(candidate.format_id)
     output_template = downloads_dir / f"source-{token}-{safe_format}.%(ext)s"
@@ -238,11 +302,14 @@ def _download_format(
         "--socket-timeout",
         "30",
         "--retries",
-        "3",
+        "0",
+        "--continue",
         "-f",
         candidate.format_id,
         "-o",
         str(output_template),
+        *(["--no-check-certificates"] if no_check_certificates else []),
+        *_http_header_args(http_headers),
         url,
     ]
     process = subprocess.Popen(
@@ -283,6 +350,46 @@ def _download_format(
     if not candidates:
         raise RuntimeError("скачанный файл не найден")
     return candidates[0]
+
+
+def _is_network_error(message: str) -> bool:
+    text = message.casefold()
+    markers = (
+        "timed out", "timeout", "getaddrinfo failed", "name resolution",
+        "temporary failure in name resolution", "connection reset",
+        "connection aborted", "connection refused", "network is unreachable",
+        "network unreachable", "no route to host", "remote end closed connection",
+        "winerror 10050", "winerror 10051", "winerror 10053", "winerror 10054",
+        "winerror 10060", "winerror 10061", "winerror 11001",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _partial_download_bytes(downloads_dir: Path) -> int:
+    total = 0
+    for path in downloads_dir.glob("*.part"):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _wait_for_network(
+    error: NetworkDownloadError, *, phase: str, attempt: int, url: str,
+    downloads_dir: Path, network_wait: NetworkWaitCallback | None,
+    should_stop: StopCallback | None,
+) -> bool:
+    if should_stop and should_stop():
+        return False
+    if network_wait is None:
+        raise error
+    retry_after = min(30, 5 * (2 ** min(attempt - 1, 3)))
+    return network_wait({
+        "phase": phase, "attempt": attempt, "retry_after": retry_after,
+        "partial_bytes": _partial_download_bytes(downloads_dir),
+        "url": url, "error": str(error),
+    })
 
 
 def _probe_with_ffprobe(path: Path) -> dict | None:

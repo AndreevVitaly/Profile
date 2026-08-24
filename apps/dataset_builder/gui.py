@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from threading import Event
 
 # Поддерживаем запуск как модуль и напрямую через Run/абсолютный путь.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSettings, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,12 +23,14 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QProgressBar,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -34,6 +38,8 @@ from PyQt6.QtWidgets import (
 )
 
 from apps.dataset_builder.builder import StopRequested, build_dataset, is_url
+from apps.dataset_builder.preflight import run_preflight
+from apps.dataset_builder.video_sources import VideoSourceError, VideoSourceManager
 
 
 class BuildWorker(QObject):
@@ -41,6 +47,8 @@ class BuildWorker(QObject):
     progress = pyqtSignal(int)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
+    network_interrupted = pyqtSignal(object)
+    network_recovered = pyqtSignal()
 
     def __init__(
         self,
@@ -89,7 +97,9 @@ class BuildWorker(QObject):
         self.require_closed_mouth = require_closed_mouth
         self.require_open_eyes = require_open_eyes
         self.use_gaze_score = use_gaze_score
-        self._stop = False
+        self._stop_event = Event()
+        self._pause_event = Event()
+        self._network_retry_event = Event()
 
     @pyqtSlot()
     def run(self) -> None:
@@ -119,16 +129,49 @@ class BuildWorker(QObject):
                 use_gaze_score=self.use_gaze_score,
                 log=self.log.emit,
                 progress=self._emit_progress,
-                should_stop=lambda: self._stop,
+                should_stop=self._should_stop,
+                network_wait=self._wait_for_network,
+                network_recovered=self.network_recovered.emit,
             )
             self.finished.emit(summary)
         except StopRequested as error:
             self.failed.emit(str(error))
+        except VideoSourceError as error:
+            self.log.emit("Technical video source diagnostics:\n" + error.technical_details())
+            self.failed.emit(error.user_message())
         except Exception as error:  # noqa: BLE001 - ошибка должна попасть в GUI.
             self.failed.emit(str(error))
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop_event.set()
+        self._pause_event.clear()
+        self._network_retry_event.set()
+
+    def pause(self) -> None:
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        self._pause_event.clear()
+
+    def retry_network(self) -> None:
+        self._network_retry_event.set()
+
+    def _wait_for_network(self, state: dict) -> bool:
+        self._network_retry_event.clear()
+        self.network_interrupted.emit(state)
+        retry_after = int(state.get("retry_after", 10))
+        deadline = retry_after * 10
+        for _ in range(deadline):
+            if self._stop_event.is_set():
+                return False
+            if self._network_retry_event.wait(0.1):
+                break
+        return not self._stop_event.is_set()
+
+    def _should_stop(self) -> bool:
+        while self._pause_event.is_set() and not self._stop_event.is_set():
+            self._stop_event.wait(0.1)
+        return self._stop_event.is_set()
 
     def _emit_progress(self, current: int, total: int) -> None:
         self.progress.emit(int(current / max(total, 1) * 100))
@@ -141,11 +184,24 @@ class MainWindow(QMainWindow):
         self.resize(920, 680)
         self.thread: QThread | None = None
         self.worker: BuildWorker | None = None
+        self._network_dialog: QMessageBox | None = None
+        self._pending_local_path: str | None = None
+        self.settings = QSettings("ORION", "DatasetBuilder")
         self._build_ui()
+        self.model_path.setText(str(self.settings.value("model_path", "")))
 
     def _build_ui(self) -> None:
         root = QWidget()
-        layout = QVBoxLayout(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        scroll_area.setWidget(content)
+        root_layout.addWidget(scroll_area)
 
         source_box = QGroupBox("Источник")
         source_layout = QGridLayout(source_box)
@@ -153,16 +209,19 @@ class MainWindow(QMainWindow):
         self.folder_radio = QRadioButton("Папка изображений")
         self.folder_radio.setChecked(True)
         self.input_path = QLineEdit()
+        self.detected_source_label = QLabel("Определённый источник: —")
         self.input_path.setPlaceholderText("Папка изображений, файл изображения, видео или URL")
         browse_file = QPushButton("Файл...")
         browse_folder = QPushButton("Папка...")
         browse_file.clicked.connect(self._choose_file)
         browse_folder.clicked.connect(self._choose_folder)
+        self.input_path.textChanged.connect(self._update_detected_source)
         source_layout.addWidget(self.folder_radio, 0, 0)
         source_layout.addWidget(self.file_radio, 0, 1)
         source_layout.addWidget(self.input_path, 1, 0, 1, 2)
         source_layout.addWidget(browse_file, 1, 2)
         source_layout.addWidget(browse_folder, 1, 3)
+        source_layout.addWidget(self.detected_source_label, 2, 0, 1, 4)
         layout.addWidget(source_box)
 
         output_box = QGroupBox("Результат")
@@ -259,14 +318,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(settings_box)
 
         buttons = QHBoxLayout()
+        self.readiness_button = QPushButton("ПРОВЕРИТЬ ГОТОВНОСТЬ")
         self.start_button = QPushButton("START")
+        self.pause_button = QPushButton("ПАУЗА")
         self.stop_button = QPushButton("STOP")
         self.open_button = QPushButton("Открыть папку результата")
         self.stop_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
+        self.readiness_button.clicked.connect(self._check_readiness)
         self.start_button.clicked.connect(self._start)
+        self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button.clicked.connect(self._stop)
         self.open_button.clicked.connect(self._open_result)
+        buttons.addWidget(self.readiness_button)
         buttons.addWidget(self.start_button)
+        buttons.addWidget(self.pause_button)
         buttons.addWidget(self.stop_button)
         buttons.addWidget(self.open_button)
         layout.addLayout(buttons)
@@ -286,17 +352,30 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMinimumHeight(160)
         layout.addWidget(self.progress)
         layout.addWidget(self.log, 1)
 
         self.setCentralWidget(root)
+
+    def _update_detected_source(self, value: str) -> None:
+        source = value.strip()
+        if not source:
+            self.detected_source_label.setText("Определённый источник: —")
+            return
+        try:
+            label = VideoSourceManager().source_label(source)
+        except VideoSourceError:
+            path = Path(source)
+            label = "Папка изображений" if path.is_dir() else "Неизвестный источник"
+        self.detected_source_label.setText(f"Определённый источник: {label}")
 
     def _choose_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Выбрать файл",
             "",
-            "Media (*.jpg *.jpeg *.png *.bmp *.webp *.mp4 *.avi *.mov *.mkv *.webm);;All files (*.*)",
+            "Media (*.jpg *.jpeg *.png *.bmp *.webp *.mp4 *.avi *.mov *.mkv *.webm *.mpeg *.mpg *.m4v *.ts *.flv *.ogv);;All files (*.*)",
         )
         if path:
             self.input_path.setText(path)
@@ -322,6 +401,7 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.model_path.setText(path)
+            self.settings.setValue("model_path", path)
 
     def _choose_topology(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -332,6 +412,27 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.topology_path.setText(path)
+
+    def _check_readiness(self) -> bool:
+        input_path = self.input_path.text().strip()
+        output_dir = self.output_path.text().strip()
+        if not input_path or not output_dir:
+            QMessageBox.warning(self, "Dataset Builder", "Укажите источник и папку результата.")
+            return False
+        report = run_preflight(
+            input_path, output_dir,
+            backend="onnx" if self.backend_onnx.isChecked() else "mediapipe",
+            model_path=self.model_path.text().strip() or None,
+            topology_path=self.topology_path.text().strip() or None,
+        )
+        icons = {"pass": "✓", "warning": "!", "error": "✗"}
+        lines = [f"{icons[item['status']]} {item['message']}" for item in report["checks"]]
+        self.log.setPlainText("\n".join(lines))
+        if report["status"] == "ready":
+            QMessageBox.information(self, "Dataset Builder", "ORION готов к запуску.\n\n" + "\n".join(lines))
+            return True
+        QMessageBox.warning(self, "Dataset Builder", "ORION не готов к запуску.\n\n" + "\n".join(lines))
+        return False
 
     def _start(self) -> None:
         input_path = self.input_path.text().strip()
@@ -346,6 +447,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Dataset Builder", "Источник не найден.")
             return
 
+        self.settings.setValue("model_path", self.model_path.text().strip())
         self.progress.setRange(0, 0)
         self.log.clear()
         self._update_counters(None)
@@ -377,14 +479,88 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self._append_log)
         self.worker.progress.connect(self._set_progress)
+        self.worker.network_interrupted.connect(self._show_network_interruption)
+        self.worker.network_recovered.connect(self._network_restored)
         self.worker.finished.connect(self._finished)
         self.worker.failed.connect(self._failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
         self.start_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
+        self.pause_button.setText("ПАУЗА")
         self.stop_button.setEnabled(True)
         self.thread.start()
+
+    def _show_network_interruption(self, state: dict) -> None:
+        self.pause_button.setEnabled(False)
+        self.pause_button.setText("ОЖИДАНИЕ СЕТИ")
+        partial_mb = int(state.get("partial_bytes", 0)) / (1024 * 1024)
+        details = (
+            f"Загрузка поставлена на паузу.\n"
+            f"Этап: {state.get('phase')}\n"
+            f"Попытка восстановления: {state.get('attempt')}\n"
+            f"Загружено частично: {partial_mb:.1f} МБ\n"
+            f"Автоповтор через: {state.get('retry_after')} сек.\n\n"
+            f"{state.get('error', '')}"
+        )
+        if self._network_dialog is None:
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("Соединение прервано")
+            dialog.setText("Интернет-соединение с источником потеряно")
+            dialog.addButton("Повторить сейчас", QMessageBox.ButtonRole.ActionRole)
+            dialog.addButton("Ждать восстановления", QMessageBox.ButtonRole.AcceptRole)
+            dialog.addButton("Выбрать локальное видео", QMessageBox.ButtonRole.ActionRole)
+            dialog.addButton("Параметры сети", QMessageBox.ButtonRole.HelpRole)
+            dialog.addButton("Остановить", QMessageBox.ButtonRole.RejectRole)
+            dialog.buttonClicked.connect(self._network_command)
+            dialog.finished.connect(lambda _result: setattr(self, "_network_dialog", None))
+            self._network_dialog = dialog
+        self._network_dialog.setInformativeText(details)
+        self._network_dialog.show()
+        self._network_dialog.raise_()
+
+    def _network_command(self, button) -> None:
+        command = button.text()
+        worker = self.worker
+        if command == "Повторить сейчас" and worker:
+            worker.retry_network()
+            self._append_log("Повторное подключение запрошено пользователем.")
+        elif command == "Выбрать локальное видео" and worker:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Выбрать локальное видео", "",
+                "Video (*.mp4 *.avi *.mov *.mkv *.webm *.mpeg *.mpg *.m4v *.ts *.flv *.ogv);;All files (*.*)",
+            )
+            if path:
+                self._pending_local_path = path
+                worker.stop()
+        elif command == "Параметры сети":
+            QDesktopServices.openUrl(QUrl("ms-settings:network-status"))
+        elif command == "Остановить" and worker:
+            worker.stop()
+        else:
+            self._append_log("Автоматическое ожидание сети продолжается.")
+
+    def _network_restored(self) -> None:
+        if self._network_dialog:
+            self._network_dialog.close()
+            self._network_dialog = None
+        self.pause_button.setEnabled(True)
+        self.pause_button.setText("ПАУЗА")
+        self._append_log("Соединение восстановлено. Загрузка продолжена.")
+
+    def _toggle_pause(self) -> None:
+        if not self.worker:
+            return
+        if self.pause_button.text() == "ПАУЗА":
+            self.worker.pause()
+            self.pause_button.setText("ПРОДОЛЖИТЬ")
+            self._append_log("Пауза запрошена...")
+        else:
+            self.worker.resume()
+            self.pause_button.setText("ПАУЗА")
+            self._append_log("Обработка продолжена.")
 
     def _stop(self) -> None:
         if self.worker:
@@ -392,9 +568,14 @@ class MainWindow(QMainWindow):
             self._append_log("Остановка запрошена...")
 
     def _finished(self, summary: dict) -> None:
+        if self._network_dialog:
+            self._network_dialog.close()
+            self._network_dialog = None
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.start_button.setEnabled(True)
+        self.pause_button.setEnabled(False)
+        self.pause_button.setText("ПАУЗА")
         self.stop_button.setEnabled(False)
         self._update_counters(summary)
         self._append_log(f"Готово: {summary.get('output_dir')}")
@@ -402,8 +583,22 @@ class MainWindow(QMainWindow):
     def _failed(self, message: str) -> None:
         self.progress.setRange(0, 100)
         self.start_button.setEnabled(True)
+        self.pause_button.setEnabled(False)
+        self.pause_button.setText("ПАУЗА")
         self.stop_button.setEnabled(False)
         self._append_log(message)
+        if self._network_dialog:
+            self._network_dialog.close()
+            self._network_dialog = None
+        if self._pending_local_path:
+            path = self._pending_local_path
+            self._pending_local_path = None
+            self.input_path.setText(path)
+            self.file_radio.setChecked(True)
+            self._append_log("Переход к выбранному локальному видео.")
+            if self.thread:
+                self.thread.finished.connect(lambda: QTimer.singleShot(0, self._start))
+            return
         QMessageBox.warning(self, "Dataset Builder", message)
 
     def _set_progress(self, value: int) -> None:

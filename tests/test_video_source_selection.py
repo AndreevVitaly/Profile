@@ -81,6 +81,55 @@ class VideoSourceSelectionTestCase(unittest.TestCase):
         self.assertEqual(result.source_media["selected_format_id"], "720")
         self.assertIn("quality_fallback_used", result.source_media["warnings"])
 
+    def test_recognizes_retryable_network_errors(self):
+        self.assertTrue(vs._is_network_error("WinError 10054 connection reset"))
+        self.assertTrue(vs._is_network_error("getaddrinfo failed"))
+        self.assertFalse(vs._is_network_error("HTTP Error 403: Forbidden"))
+
+    def test_network_wait_reports_partial_file_and_backoff(self):
+        states = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "video.part").write_bytes(b"x" * 123)
+            result = vs._wait_for_network(
+                vs.NetworkDownloadError("timed out"),
+                phase="download", attempt=2, url="https://example.test/video",
+                downloads_dir=root, network_wait=lambda state: states.append(state) or True,
+                should_stop=lambda: False,
+            )
+        self.assertTrue(result)
+        self.assertEqual(states[0]["partial_bytes"], 123)
+        self.assertEqual(states[0]["retry_after"], 10)
+
+    @patch("apps.dataset_builder.video_source.probe_video")
+    @patch("apps.dataset_builder.video_source._is_readable_video", return_value=True)
+    @patch("apps.dataset_builder.video_source._download_format")
+    @patch("apps.dataset_builder.video_source._fetch_video_info")
+    def test_network_failure_retries_same_format(
+        self, info_mock, download_mock, _readable_mock, probe_mock
+    ):
+        info_mock.return_value = {"formats": [_fmt("1080", 1080)]}
+        waits = []
+        recovered = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "video.mp4"
+            video.write_bytes(b"video")
+            download_mock.side_effect = [vs.NetworkDownloadError("timed out"), video]
+            probe_mock.return_value = {
+                "width": 1920, "height": 1080, "fps": 30.0, "codec": "h264",
+                "bitrate": 1000, "duration": 1.0, "verified": True,
+                "verification_tool": "ffprobe",
+            }
+            result = vs.download_best_video_source(
+                "https://example.test/video", Path(directory),
+                network_wait=lambda state: waits.append(state) or True,
+                network_recovered=recovered,
+            )
+        self.assertEqual(result.path, video)
+        self.assertEqual(download_mock.call_count, 2)
+        self.assertEqual(len(waits), 1)
+        recovered.assert_called_once_with()
+
     @patch("apps.dataset_builder.video_source.subprocess.run")
     def test_probe_video_reads_ffprobe_result(self, run_mock):
         run_mock.return_value = Mock(
@@ -187,21 +236,22 @@ class VideoSourceSelectionTestCase(unittest.TestCase):
         self.assertEqual(summary["face_effective_resolution"]["p10_face_height_px"], 560.0)
 
     @patch("apps.dataset_builder.builder._extract_video_frames")
-    @patch("apps.dataset_builder.builder._local_video_source_media")
-    def test_local_video_remains_supported(self, media_mock, extract_mock):
+    @patch("apps.dataset_builder.video_sources.local_file.probe_video")
+    def test_local_video_remains_supported(self, probe_mock, extract_mock):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video = root / "local.mp4"
             video.write_bytes(b"video")
             frame = root / "frame000000.jpg"
             frame.write_bytes(b"frame")
-            media_mock.return_value = {
+            probe_mock.return_value = {
                 "requested_quality": "local_file",
                 "selected_format_id": "local",
                 "width": 1280,
                 "height": 720,
-                "download_strategy": "local_file",
-                "warnings": [],
+                "fps": 25.0,
+                "codec": "h264",
+                "verified": True,
             }
             extract_mock.return_value = [frame]
 

@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--backend", default="mediapipe")
     run.add_argument("--model", dest="model_path")
     run.add_argument("--topology", dest="topology_path")
+    run.add_argument("--force-3d", action="store_true")
+    run.add_argument("--min-3d-frames", type=int, default=3)
+    run.add_argument("--max-3d-frames", type=int, default=21)
+    run.add_argument("--max-frames-per-pose-bin", type=int, default=3)
+    run.add_argument("--scale-mode", choices=("unit_ipd", "unit_face_width"), default="unit_ipd")
+    run.add_argument("--fusion-method", choices=("median", "weighted_mean"), default="median")
     return parser
 
 
@@ -43,6 +49,12 @@ def main() -> None:
             "backend": args.backend,
             "model_path": args.model_path,
             "topology_path": args.topology_path,
+            "force_3d": args.force_3d,
+            "min_3d_frames": args.min_3d_frames,
+            "max_3d_frames": args.max_3d_frames,
+            "max_frames_per_pose_bin": args.max_frames_per_pose_bin,
+            "scale_mode": args.scale_mode,
+            "fusion_method": args.fusion_method,
         }
         result = run_profile_engine(args.dataset, config=config)
         print(json.dumps(result, ensure_ascii=False, indent=2))

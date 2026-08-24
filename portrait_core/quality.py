@@ -109,6 +109,11 @@ def assess_image_quality(image_path: str, points: dict, *, source_type: str | No
         "neutral_expression": "рот заметно открыт; требуется нейтральное выражение",
         "resolution": resolution_code,
     }
+    labels["resolution"] = (
+        "\u043d\u0438\u0437\u043a\u043e\u0435 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043d\u0438\u0435 \u0432\u0438\u0434\u0435\u043e"
+        if source_type == "video_frame"
+        else "\u043d\u0438\u0437\u043a\u043e\u0435 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043d\u0438\u0435 \u0444\u043e\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u0438"
+    )
     issues = [labels[name] for name, passed in checks.items() if not passed]
     codes = [issue_codes[name] for name, passed in checks.items() if not passed]
     return {

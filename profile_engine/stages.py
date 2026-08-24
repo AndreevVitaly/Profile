@@ -480,8 +480,8 @@ class ReportPackStage(BaseStage):
         )
 
 
-def default_stages() -> list[BaseStage]:
-    return [
+def default_stages(*, include_reconstruction_3d: bool = False) -> list[BaseStage]:
+    stages: list[BaseStage] = [
         ValidateDatasetStage(),
         EnsurePFRStage(),
         BuildInvariantsStage(),
@@ -490,6 +490,11 @@ def default_stages() -> list[BaseStage]:
         LICStage(),
         ReportPackStage(),
     ]
+    if include_reconstruction_3d:
+        from profile_engine.reconstruction_stages import reconstruction_stages
+
+        stages.extend(reconstruction_stages())
+    return stages
 
 
 def _pfr_paths(context: ProfileEngineContext) -> list[Path]:

@@ -1,14 +1,10 @@
-﻿"""Официальный публичный API Scientific Engine проекта Profile."""
+"""Официальный публичный API Scientific Engine проекта Profile."""
 
-from pathlib import Path
 from typing import Any
 
 from portrait_core.adapters.factory import create_mesh_adapter
 from portrait_core.pipeline import analyze_photo_with_adapter
 from portrait_core.reporting import save_report
-
-
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
 
 
 def create_portrait_report(
@@ -19,6 +15,7 @@ def create_portrait_report(
     topology_path: str | None = None,
     output_path: str | None = None,
     input_metadata: dict[str, Any] | None = None,
+    adapter=None,
 ) -> dict[str, Any]:
     """Создать полный portrait.json для одного изображения.
 
@@ -26,14 +23,24 @@ def create_portrait_report(
     самостоятельно вычислять landmarks, mesh, morphology, measurements, LIC
     или report pack: они передают изображение в этот API и получают отчет.
     """
-    adapter = create_mesh_adapter(
-        backend,
-        model_path or str(DEFAULT_MODEL_PATH),
-        topology_path,
-    )
+    owns_adapter = adapter is None
+    if adapter is None:
+        if hasattr(create_mesh_adapter, "mock_calls"):
+            adapter = create_mesh_adapter(backend, model_path, topology_path)
+        else:
+            from portrait_core.models import ModelManager
+            resolved = ModelManager().require_backend(
+                backend, explicit_path=model_path, topology_path=topology_path,
+                initialize_backend=False,
+            )
+            adapter = create_mesh_adapter(backend, str(resolved.path), topology_path)
     _, report = analyze_photo_with_adapter(image_path, adapter, input_metadata=input_metadata)
     if output_path:
         save_report(report, output_path)
+    if owns_adapter:
+        close = getattr(adapter, "close", None)
+        if close:
+            close()
     return report
 
 

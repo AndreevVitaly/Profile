@@ -86,7 +86,7 @@ def select_quality_profile_frames(
         should_stop=should_stop,
     )
     selected = _select_candidates(candidates, cfg, fps)
-    selected_paths = _write_selected_frames(selected, frame_cache, selected_dir)
+    selected_paths = _write_selected_frames(selected, video, selected_dir)
     selected_by_index = {item["frame_index"]: path for item, path in zip(selected, selected_paths)}
 
     with candidates_path.open("w", encoding="utf-8") as handle:
@@ -154,13 +154,14 @@ def _scan_candidates(
         while True:
             if should_stop and should_stop():
                 break
+            if frame_index % scan_step != 0:
+                if not capture.grab():
+                    break
+                frame_index += 1
+                continue
             ok, frame = capture.read()
             if not ok:
                 break
-            if frame_index % scan_step != 0:
-                frame_index += 1
-                continue
-            scanned += 1
             height, width = frame.shape[:2]
             gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             motion_score = _motion_score(gray_full, previous_gray)
@@ -211,7 +212,7 @@ def _scan_candidates(
                         "occlusion_score": 0.0,
                     }
                 )
-                frame_cache[frame_index] = frame.copy()
+                # Final selected frames are decoded on demand after ranking.
             if log and scanned % 100 == 0:
                 suffix = f"/{total_frames}" if total_frames else ""
                 log(f"candidate scan: sampled {scanned}, source frame {frame_index}{suffix}")
@@ -343,14 +344,26 @@ def _episodes(candidates: list[dict], *, max_gap_seconds: float) -> list[list[di
     return episodes
 
 
-def _write_selected_frames(selected: list[dict], frame_cache: dict[int, object], output_dir: Path) -> list[Path]:
+def _write_selected_frames(selected: list[dict], video_path: Path, output_dir: Path) -> list[Path]:
+    import cv2
+
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    for index, item in enumerate(selected, start=1):
-        frame = frame_cache[item["frame_index"]]
-        path = output_dir / f"{index:04d}_selected_frame{item['frame_index']:06d}.jpg"
-        _write_jpeg(path, frame)
-        paths.append(path)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not reopen video: {video_path}")
+    try:
+        for index, item in enumerate(selected, start=1):
+            frame_index = int(item["frame_index"])
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(f"Could not decode selected frame {frame_index}")
+            path = output_dir / f"{index:04d}_selected_frame{frame_index:06d}.jpg"
+            _write_jpeg(path, frame)
+            paths.append(path)
+    finally:
+        capture.release()
     return paths
 
 
